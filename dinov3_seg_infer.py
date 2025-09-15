@@ -1,0 +1,197 @@
+import os, io, argparse, requests, sys
+from functools import partial
+from pathlib import Path
+
+import torch
+from PIL import Image
+import numpy as np
+import cv2
+from torchvision import transforms
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Utils
+# ──────────────────────────────────────────────────────────────────────────────
+def load_image_from_url(url: str) -> Image.Image:
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    return Image.open(io.BytesIO(r.content)).convert("RGB")
+
+def load_image_from_path(p: str | Path) -> Image.Image:
+    p = Path(p)
+    if not p.is_file():
+        raise FileNotFoundError(f"[ERR] image file not found: {p}")
+    return Image.open(p).convert("RGB")
+
+def make_transform(resize_size: int = 224):
+    # README의 LVD-1689M용 표준 변환
+    # mean/std = (0.485,0.456,0.406)/(0.229,0.224,0.225)
+    resize = transforms.Resize((resize_size, resize_size), antialias=True)
+    to_tensor = transforms.ToTensor()
+    normalize = transforms.Normalize(
+        mean=(0.485, 0.456, 0.406),
+        std=(0.229, 0.224, 0.225),
+    )
+    return transforms.Compose([resize, to_tensor, normalize])
+
+def colorize_mask(mask_hw: np.ndarray, num_classes: int) -> np.ndarray:
+    # 고정 시드 팔레트 (재현성)
+    rng = np.random.default_rng(42)
+    palette = (rng.integers(0, 256, size=(num_classes, 3))).astype(np.uint8)
+    return palette[mask_hw % num_classes]
+
+def overlay(image_rgb: np.ndarray, mask_rgb: np.ndarray, alpha: float = 0.5) -> np.ndarray:
+    # 크기 다르면 mask를 원본에 맞춤
+    if image_rgb.shape[:2] != mask_rgb.shape[:2]:
+        mask_rgb = cv2.resize(
+            mask_rgb, (image_rgb.shape[1], image_rgb.shape[0]),
+            interpolation=cv2.INTER_NEAREST
+        )
+    # 채널 3개 보장
+    if image_rgb.ndim == 2:
+        image_rgb = cv2.cvtColor(image_rgb, cv2.COLOR_GRAY2RGB)
+    if mask_rgb.ndim == 2:
+        mask_rgb = cv2.cvtColor(mask_rgb, cv2.COLOR_GRAY2RGB)
+
+    out = cv2.addWeighted(
+        image_rgb.astype(np.float32), 1 - alpha,
+        mask_rgb.astype(np.float32), alpha, 0.0
+    )
+    return out.clip(0, 255).astype(np.uint8)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────────
+def main():
+    ap = argparse.ArgumentParser()
+    # 로컬 파일 경로 우선
+    ap.add_argument("--image-path", type=str, help="세그멘테이션할 로컬 이미지 경로 (우선 사용)")
+    ap.add_argument("--image-url", type=str, help="이미지 URL (image-path 없을 때만 사용)")
+
+    ap.add_argument("--repo-dir", default="./", type=str,
+                    help="클론한 facebookresearch/dinov3 경로 (torch.hub source='local')")
+    ap.add_argument("--weights-dir", default="./weights", type=str)
+
+    # 체크포인트 파일명 (weights-dir 내부의 파일명)
+    ap.add_argument("--backbone-ckpt", default="dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth", type=str,
+                    help="예: dinov3_vit7b16_backbone.pth")
+    ap.add_argument("--seg-ckpt", default="dinov3_vit7b16_ade20k_m2f_head-bf307cb1.pth", type=str,
+                    help="예: dinov3_vit7b16_ms_ade20k_head.pth")
+
+    # Hub entry: README 기준 세그멘테이터 예시는 'dinov3_vit7b16_ms'
+    ap.add_argument("--hub-entry", default="dinov3_vit7b16_ms", type=str,
+                    help="예: dinov3_vit7b16_ms (ADE20K), dinov3_vit7b16_dd (depth) 등")
+    ap.add_argument("--img-size", default=896, type=int)
+    ap.add_argument("--num-classes", default=150, type=int,  # ADE20K = 150
+                    help="세그멘테이션 클래스 수")
+
+    # 저장 경로 인자
+    ap.add_argument("--save-path", default="./segmentation_overlay.png", type=str,
+                    help="원본+segmentation overlay 이미지 저장 경로")
+    ap.add_argument("--save-mask-path", default=None, type=str,
+                    help="색상화된 segmentation map 저장 경로 (미지정 시 save-path에 _mask 접미사)")
+
+    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", type=str)
+    args = ap.parse_args()
+
+    repo_dir = Path(args.repo_dir)
+    assert repo_dir.exists(), f"[ERR] repo-dir not found: {repo_dir} (git clone facebookresearch/dinov3)"
+
+    # dinov3 내부 유틸 import
+    sys.path.append(str(repo_dir.resolve()))
+    try:
+        from dinov3.eval.segmentation.inference import make_inference
+    except Exception as e:
+        raise RuntimeError(
+            f"[ERR] cannot import dinov3 inference utils from {repo_dir}. "
+            f"'pip install -e {repo_dir}' 혹은 PYTHONPATH 설정을 확인하세요."
+        ) from e
+
+    # 이미지 로드: 파일 경로가 있으면 우선 사용
+    if args.image_path:
+        pil = load_image_from_path(args.image_path)
+        base_name = Path(args.image_path).stem
+    elif args.image_url:
+        pil = load_image_from_url(args.image_url)
+        base_name = "image"
+    else:
+        raise ValueError("[ERR] one of --image-path or --image-url must be provided")
+
+    W0, H0 = pil.size
+
+    # 변환
+    tfm = make_transform(args.img_size)
+    batch = tfm(pil)[None, ...]  # [1,3,H,W]
+
+    # 체크포인트 경로
+    backbone_ckpt_path = str(Path(args.weights_dir) / args.backbone_ckpt)
+    seg_ckpt_path = str(Path(args.weights_dir) / args.seg_ckpt)
+
+    if not os.path.isfile(backbone_ckpt_path):
+        raise FileNotFoundError(f"[ERR] backbone ckpt not found: {backbone_ckpt_path}")
+    if not os.path.isfile(seg_ckpt_path):
+        raise FileNotFoundError(f"[ERR] segmentor ckpt not found: {seg_ckpt_path}")
+
+    # 모델 로드 (PyTorch Hub / source='local')
+    print(f"[INFO] Loading hub entry '{args.hub_entry}' ...")
+    segmentor = torch.hub.load(
+        str(repo_dir),
+        args.hub_entry,
+        source="local",
+        weights=seg_ckpt_path,
+        backbone_weights=backbone_ckpt_path,
+    ).to(args.device).eval()
+
+    # 인퍼런스
+    with torch.inference_mode():
+        batch = batch.to(args.device)
+        amp_dtype = torch.bfloat16 if args.device.startswith("cuda") else torch.float32
+        with torch.autocast(device_type="cuda" if args.device.startswith("cuda") else "cpu",
+                            dtype=amp_dtype):
+            seg_logits = make_inference(
+                batch,
+                segmentor,
+                inference_mode="slide",
+                decoder_head_type="m2f",  # README 예시 head
+                rescale_to=(H0, W0),
+                n_output_channels=args.num_classes,
+                crop_size=(args.img_size, args.img_size),
+                stride=(args.img_size, args.img_size),  # 필요시 (img_size//2, img_size//2)로 겹치기
+                output_activation=partial(torch.nn.functional.softmax, dim=1),
+            )  # [1, C, H0, W0]
+
+        pred = seg_logits.argmax(dim=1)[0].detach().cpu().numpy().astype(np.int32)  # [H0,W0]
+
+    # ── 저장 경로 준비
+    save_overlay_path = Path(args.save_path)
+    if args.save_mask_path is None:
+        save_mask_path = save_overlay_path.with_name(
+            f"{save_overlay_path.stem}_mask{save_overlay_path.suffix or '.png'}"
+        )
+    else:
+        save_mask_path = Path(args.save_mask_path)
+    
+    # 색상화/오버레이 생성
+    rgb = np.array(pil, dtype=np.uint8)
+    mask_rgb = colorize_mask(pred, args.num_classes)   # [H0,W0,3] (RGB 색상)
+    vis = overlay(rgb, mask_rgb, alpha=0.5)
+    
+    # ✅ (A) 사람 보기용: 컬러 마스크 & 오버레이
+    cv2.imwrite(str(save_mask_path), cv2.cvtColor(mask_rgb, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(str(save_overlay_path), cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+    
+    # ✅ (B) 뷰어/후처리용: 인덱스 PNG(단일채널, 픽셀=클래스ID)
+    idx_png = save_overlay_path.with_name(f"{save_overlay_path.stem}_idx.png")
+    Image.fromarray(pred.astype(np.uint8), mode="L").save(idx_png)
+    
+    # (선택) NPY도 저장
+    # np.save(save_overlay_path.with_name(f"{save_overlay_path.stem}_idx.npy"), pred)
+    
+    print(f"[DONE] saved segmap(color): {save_mask_path}")
+    print(f"[DONE] saved overlay     : {save_overlay_path}")
+    print(f"[DONE] saved segmap(index): {idx_png}")
+
+
+if __name__ == "__main__":
+    main()
